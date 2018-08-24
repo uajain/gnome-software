@@ -30,6 +30,7 @@
 
 #include <sys/signal.h>
 #include <glib/gi18n.h>
+#include <sys/statvfs.h>
 
 #include "gs-appstream.h"
 #include "gs-flatpak-app.h"
@@ -3666,12 +3667,56 @@ app_has_local_source (GsApp *app)
 		(url != NULL && g_str_has_prefix (url, "file://"));
 }
 
+// Check with Rob if we want this heuristic for install too or only
+// auto updates
+static gboolean
+gs_flatpak_allow_install_or_update (GsFlatpak *self, GsApp *app)
+{
+	g_autoptr (GFile) installation_dir = NULL;
+	g_autofree gchar *path = NULL;
+	GsApp *runtime, *update_runtime;
+	guint64 app_installed_size;
+	guint64 check_disk_space;
+	struct statvfs buf;
+
+	//have different code paths for install and the update logic
+
+	installation_dir = flatpak_installation_get_path (self->installation);
+	path = g_file_get_path (installation_dir);
+
+	if (statvfs (path, &buf) == -1) {
+		//error handing
+	}
+
+	app_installed_size = gs_app_get_size_installed (app);
+	runtime = gs_app_get_runtime (app);
+	update_runtime = gs_app_get_update_runtime (app);
+
+	if (gs_flatpak_app_needs_repair (app))
+		check_disk_space = app_installed_size + gs_app_get_size_installed (runtime);
+	else
+		check_disk_space = app_installed_size;
+
+	//there is also gs_app_get_size_download
+	if (buf.f_bfree > (check_disk_space / buf.f_bsize + 1))
+		return TRUE;
+	return FALSE;
+}
+
 gboolean
 gs_flatpak_app_install (GsFlatpak *self,
 			GsApp *app,
 			GCancellable *cancellable,
 			GError **error)
 {
+	if (gs_utils_app_is_auto_updating (app)) {
+		if (!gs_flatpak_allow_install_or_update (self, app)) {
+			g_debug ("Skipping installation for: %s as prone to failure due to disk-space",
+				  gs_app_get_id (app));
+			return TRUE;
+		}
+	}
+
 	/* queue for install if installation needs the network */
 	if (!app_has_local_source (app) &&
 	    !gs_plugin_get_network_available (self->plugin)) {
