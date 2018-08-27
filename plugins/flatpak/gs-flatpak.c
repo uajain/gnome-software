@@ -3678,6 +3678,75 @@ app_has_local_source (GsApp *app)
 		(url != NULL && g_str_has_prefix (url, "file://"));
 }
 
+static guint64
+get_installation_dir_free_space (GsFlatpak *self)
+{
+	g_autoptr (GFile) installation_dir = NULL;
+	g_autoptr (GFileInfo) info = NULL;
+	g_autoptr (GError) local_error = NULL;
+	guint64 free_space = 0;
+
+	installation_dir = flatpak_installation_get_path (self->installation);
+
+	info = g_file_query_filesystem_info (installation_dir,
+					     G_FILE_ATTRIBUTE_FILESYSTEM_FREE,
+					     NULL,
+					     &local_error);
+	if (info == NULL)
+		g_warning ("Failed to query filesystem info: %s", local_error->message);
+
+	free_space = g_file_info_get_attribute_uint64 (info, G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
+	return free_space;
+}
+
+static gboolean
+gs_flatpak_has_space_to_install (GsFlatpak *self, GsApp *app, GsAppList *list)
+{
+	guint64 free_space = 0;
+	guint64 space_required = 0;
+
+	space_required = gs_app_get_size_download (app);
+	if (space_required == GS_APP_SIZE_UNKNOWABLE)
+		g_warning ("Failed to query download size: %s", gs_app_get_unique_id (app));
+
+	space_required = space_required + (500 * 1024 * 1024); /* min-free-space-size = 500MB for Endless */
+	free_space = get_installation_dir_free_space (self);
+
+	if (free_space < space_required)
+		return FALSE;
+
+	return TRUE;
+}
+
+static gboolean
+gs_flatpak_has_space_to_update (GsFlatpak *self, GsApp *app, GsAppList *list)
+{
+	guint64 free_space = 0;
+	guint64 space_required = 0;
+
+	/* If an app has an updatable runtime, the runtime is not updated
+	 * as a part of app update.
+	 *
+	 * Having said that, runtime updates and their related refs (see T22716)
+	 * are done together and below heuristics might not be good for if GsApp
+	 * app is a runtime.
+	 */
+	if (gs_utils_app_is_auto_updating (app)) {
+		for (guint i = 0; i < gs_app_list_length (list); i++) {
+			GsApp *app_temp = gs_app_list_index (list, i);
+			space_required += gs_app_get_size_installed (app_temp);
+		}
+	}
+
+	space_required = (space_required * 2) + (500 * 1024 * 1024); /* min-free-space-size = 500MB for Endless */
+	free_space = get_installation_dir_free_space (self);
+
+	if (free_space < space_required)
+		return FALSE;
+
+	return TRUE;
+}
+
 gboolean
 gs_flatpak_app_install (GsFlatpak *self,
 			GsApp *app,
@@ -3876,6 +3945,15 @@ gs_flatpak_app_install (GsFlatpak *self,
 			return FALSE;
 		}
 
+		if (!gs_flatpak_has_space_to_install (self, app, list)) {
+			g_debug ("Skipping installation for %s: not enough space on disk",
+				 gs_app_get_unique_id (app));
+			g_set_error (error, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+				     "You don't have enough space to install %s. Please remove apps or documents to create more space.",
+				     gs_app_get_unique_id (app));
+			return FALSE;
+		}
+
 		/* install all the required packages */
 		phelper = gs_flatpak_progress_helper_new (self->plugin, app);
 		phelper->job_max = gs_app_list_length (list);
@@ -3982,6 +4060,12 @@ gs_flatpak_update_app (GsFlatpak *self,
 			gs_app_set_state_recover (app);
 			return FALSE;
 		}
+	}
+
+	if (!gs_flatpak_has_space_to_update (self, app, list)) {
+		g_debug ("Skipping automatic update for %s: not enough space on disk",
+			 gs_app_get_unique_id (app));
+		return FALSE;
 	}
 
 	/* update all the required packages */
