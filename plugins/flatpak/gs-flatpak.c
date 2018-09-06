@@ -56,6 +56,7 @@ struct _GsFlatpak {
 G_DEFINE_TYPE (GsFlatpak, gs_flatpak, G_TYPE_OBJECT)
 
 #define APP_METADATA_MOGWAI_UPDATE_PRIORITY "Mogwai::update-priority"
+#define EOS_MIN_FREE_SPACE_NEEDED_BYTES (500 * 1024 * 1024)
 
 /* higher has the value that is used by eos-updater for OS updates */
 typedef enum {
@@ -3679,29 +3680,27 @@ app_has_local_source (GsApp *app)
 }
 
 static guint64
-get_installation_dir_free_space (GsFlatpak *self)
+get_installation_dir_free_space (GsFlatpak *self, GError **error)
 {
 	g_autoptr (GFile) installation_dir = NULL;
 	g_autoptr (GFileInfo) info = NULL;
-	g_autoptr (GError) local_error = NULL;
-	guint64 free_space = 0;
 
 	installation_dir = flatpak_installation_get_path (self->installation);
 
 	info = g_file_query_filesystem_info (installation_dir,
 					     G_FILE_ATTRIBUTE_FILESYSTEM_FREE,
 					     NULL,
-					     &local_error);
+					     error);
 	if (info == NULL)
-		g_warning ("Failed to query filesystem info: %s", local_error->message);
+		return 0;
 
-	free_space = g_file_info_get_attribute_uint64 (info, G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
-	return free_space;
+	return g_file_info_get_attribute_uint64 (info, G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
 }
 
 static gboolean
 gs_flatpak_has_space_to_install (GsFlatpak *self, GsApp *app, GsAppList *list)
 {
+	g_autoptr(GError) error = NULL;
 	guint64 free_space = 0;
 	guint64 space_required = 0;
 
@@ -3709,42 +3708,47 @@ gs_flatpak_has_space_to_install (GsFlatpak *self, GsApp *app, GsAppList *list)
 	if (space_required == GS_APP_SIZE_UNKNOWABLE)
 		g_warning ("Failed to query download size: %s", gs_app_get_unique_id (app));
 
-	space_required = space_required + (500 * 1024 * 1024); /* min-free-space-size = 500MB for Endless */
-	free_space = get_installation_dir_free_space (self);
+	space_required = space_required + EOS_MIN_FREE_SPACE_NEEDED_BYTES;
+	free_space = get_installation_dir_free_space (self, &error);
+	if (error != NULL) {
+		g_warning ("Error getting the free space available for installing %s: %s",
+			   gs_app_get_unique_id (app), error->message);
+		/* Even if we fail to get free space, we don't want to block this user-intiated
+		 * install action. It might happen that there is enough space to install but
+		 * an error happened during querying the filesystem info.
+		 */
+		return TRUE;
+	}
 
-	if (free_space < space_required)
-		return FALSE;
-
-	return TRUE;
+	return free_space >= space_required;
 }
 
 static gboolean
-gs_flatpak_has_space_to_update (GsFlatpak *self, GsApp *app, GsAppList *list)
+gs_flatpak_has_space_to_update (GsFlatpak *self, GsApp *app, GsAppList *list, gboolean is_auto_update)
 {
+	g_autoptr(GError) error = NULL;
 	guint64 free_space = 0;
 	guint64 space_required = 0;
 
-	/* If an app has an updatable runtime, the runtime is not updated
-	 * as a part of app update.
-	 *
-	 * Having said that, runtime updates and their related refs (see T22716)
-	 * are done together and below heuristics might not be good for if GsApp
-	 * app is a runtime.
-	 */
-	if (gs_utils_app_is_auto_updating (app)) {
+	if (is_auto_update && gs_app_get_kind (app) != AS_APP_KIND_RUNTIME) {
 		for (guint i = 0; i < gs_app_list_length (list); i++) {
 			GsApp *app_temp = gs_app_list_index (list, i);
 			space_required += gs_app_get_size_installed (app_temp);
 		}
 	}
 
-	space_required = (space_required * 2) + (500 * 1024 * 1024); /* min-free-space-size = 500MB for Endless */
-	free_space = get_installation_dir_free_space (self);
+	space_required = (space_required * 2) + EOS_MIN_FREE_SPACE_NEEDED_BYTES;
+	free_space = get_installation_dir_free_space (self, &error);
+	if (error != NULL) {
+		g_warning ("Error getting the free space available for updating %s: %s",
+			   gs_app_get_unique_id (app), error->message);
+		/* Only fail autoupdates if we cannot query the filesystem info. Manual
+		 * updates follows the pattern similar to install's case (see comment above).
+		 */
+		return is_auto_update ? FALSE : TRUE;
+	}
 
-	if (free_space < space_required)
-		return FALSE;
-
-	return TRUE;
+	return free_space >= space_required;
 }
 
 gboolean
@@ -3948,7 +3952,8 @@ gs_flatpak_app_install (GsFlatpak *self,
 		if (!gs_flatpak_has_space_to_install (self, app, list)) {
 			g_debug ("Skipping installation for %s: not enough space on disk",
 				 gs_app_get_unique_id (app));
-			g_set_error (error, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+			gs_app_set_state_recover (app);
+			g_set_error (error, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_NO_SPACE,
 				     "You don't have enough space to install %s. Please remove apps or documents to create more space.",
 				     gs_app_get_unique_id (app));
 			return FALSE;
@@ -4017,6 +4022,7 @@ gs_flatpak_update_app (GsFlatpak *self,
 	g_autoptr(GsFlatpakProgressHelper) phelper = NULL;
 	gboolean all_updates_done = TRUE;
 	gboolean is_proxy_app = FALSE;
+	gboolean is_auto_update = FALSE;
 	GsApp *runtime = NULL;
 	GsApp *update_runtime = NULL;
 
@@ -4062,9 +4068,20 @@ gs_flatpak_update_app (GsFlatpak *self,
 		}
 	}
 
-	if (!gs_flatpak_has_space_to_update (self, app, list)) {
-		g_debug ("Skipping automatic update for %s: not enough space on disk",
+	is_auto_update = gs_utils_app_is_auto_updating (app);
+	if (!gs_flatpak_has_space_to_update (self, app, list, is_auto_update)) {
+		g_debug ("Skipping %s for %s: not enough space on disk",
+			 (is_auto_update ? "automatic update" : "update"),
 			 gs_app_get_unique_id (app));
+		gs_app_set_state_recover (app);
+		if (!is_auto_update) {
+			/* Do not return an error because we don't want to see a banner
+			 * showing up out of the blue for possibly multiple update failures */
+			return TRUE;
+		}
+		g_set_error (error, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_NO_SPACE,
+			     "You don't have enough space to install %s. Please remove apps or documents to create more space.",
+			     gs_app_get_unique_id (app));
 		return FALSE;
 	}
 
